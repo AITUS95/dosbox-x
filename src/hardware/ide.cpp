@@ -287,8 +287,22 @@ public:
     virtual void play_audio_msf();
     virtual void pause_resume();
     virtual void play_audio10();
+    virtual void play_audio12();
+    virtual void play_audio_track_index();
+    virtual void stop_play_scan();
+    virtual void scan_audio();
+    virtual void play_cd();
     virtual void mode_sense();
     virtual void read_toc();
+    virtual void read_header();
+    virtual void read_cd_msf();
+    virtual void read_cd_da();
+    virtual void get_configuration();
+    virtual void get_event_status_notification();
+    virtual void read_disc_information();
+    virtual void read_track_information();
+    virtual void get_performance();
+    virtual void read_disc_structure();
 public:
     bool atapi_to_host;         /* if set, PACKET data transfer is to be read by host */
     double spinup_time;
@@ -880,6 +894,160 @@ void IDEATAPICDROMDevice::play_audio10() {
     sector_total = 0;
 }
 
+static inline uint32_t IDE_ATAPI_MSFtoLBA(const uint8_t m,const uint8_t s,const uint8_t f) {
+    uint32_t lba = (uint32_t)m * 60u * 75u;
+    lba += (uint32_t)s * 75u;
+    lba += (uint32_t)f;
+    /* Common CD-ROM convention: MSF 00:02:00 corresponds to LBA 0 */
+    if (lba >= 150u) lba -= 150u;
+    else lba = 0;
+    return lba;
+}
+
+static inline void IDE_ATAPI_LBAtoMSF(uint32_t lba,uint8_t &m,uint8_t &s,uint8_t &f) {
+    /* Convert LBA back to MSF using the same offset as above */
+    lba += 150u;
+    m = (uint8_t)(lba / (60u * 75u));
+    lba %= (60u * 75u);
+    s = (uint8_t)(lba / 75u);
+    f = (uint8_t)(lba % 75u);
+}
+
+void IDEATAPICDROMDevice::play_audio12() {
+    /* PLAY AUDIO(12) - same idea as PLAY AUDIO(10) but with a 32-bit length */
+    uint32_t start_lba = ((uint32_t)atapi_cmd[2] << 24) +
+        ((uint32_t)atapi_cmd[3] << 16) +
+        ((uint32_t)atapi_cmd[4] << 8) +
+        ((uint32_t)atapi_cmd[5] << 0);
+
+    uint32_t play_length = ((uint32_t)atapi_cmd[6] << 24) +
+        ((uint32_t)atapi_cmd[7] << 16) +
+        ((uint32_t)atapi_cmd[8] << 8) +
+        ((uint32_t)atapi_cmd[9] << 0);
+
+    CDROM_Interface *cdrom = getMSCDEXDrive();
+    if (cdrom == NULL) {
+        sector_total = 0;
+        return;
+    }
+
+    if (play_length == 0) {
+        sector_total = 0;
+        return;
+    }
+
+    if (start_lba != 0xFFFFFFFFu)
+        cdrom->PlayAudioSector(start_lba,play_length);
+    else
+        cdrom->PauseAudio(true);
+
+    sector_total = 0;
+}
+
+void IDEATAPICDROMDevice::play_audio_track_index() {
+    /* PLAY AUDIO TRACK/INDEX: play from track start to the next track start.
+     * Index is ignored; most 1990s drives did the same unless the disc contains index marks. */
+    const uint8_t start_track = atapi_cmd[4];
+    const uint8_t /*start_index*/ start_index = atapi_cmd[5];
+    (void)start_index;
+    const uint8_t end_track = atapi_cmd[7];
+    const uint8_t /*end_index*/ end_index = atapi_cmd[8];
+    (void)end_index;
+
+    CDROM_Interface *cdrom = getMSCDEXDrive();
+    if (cdrom == NULL) {
+        sector_total = 0;
+        return;
+    }
+
+    int first,last;
+    TMSF leadOut;
+    if (!cdrom->GetAudioTracks(first,last,leadOut)) {
+        sector_total = 0;
+        return;
+    }
+
+    uint8_t st = start_track;
+    uint8_t et = end_track;
+    if (st < (uint8_t)first) st = (uint8_t)first;
+    if (et == 0) et = st;
+    if (et > (uint8_t)last) et = (uint8_t)last;
+
+    TMSF start_msf = {};
+    unsigned char attr = 0;
+    if (!cdrom->GetAudioTrackInfo((int)st,start_msf,attr)) {
+        sector_total = 0;
+        return;
+    }
+
+    uint32_t start_lba = IDE_ATAPI_MSFtoLBA(start_msf.min,start_msf.sec,start_msf.fr);
+
+    /* Figure end LBA: if end track < last, use next track start; else use leadout */
+    uint32_t end_lba = 0;
+    if (et < (uint8_t)last) {
+        TMSF next_msf = {};
+        if (cdrom->GetAudioTrackInfo((int)(et + 1),next_msf,attr))
+            end_lba = IDE_ATAPI_MSFtoLBA(next_msf.min,next_msf.sec,next_msf.fr);
+        else
+            end_lba = IDE_ATAPI_MSFtoLBA(leadOut.min,leadOut.sec,leadOut.fr);
+    }
+    else {
+        end_lba = IDE_ATAPI_MSFtoLBA(leadOut.min,leadOut.sec,leadOut.fr);
+    }
+
+    if (end_lba > start_lba)
+        cdrom->PlayAudioSector(start_lba,end_lba - start_lba);
+
+    sector_total = 0;
+}
+
+void IDEATAPICDROMDevice::stop_play_scan() {
+    CDROM_Interface *cdrom = getMSCDEXDrive();
+    if (cdrom) cdrom->StopAudio();
+    sector_total = 0;
+}
+
+void IDEATAPICDROMDevice::scan_audio() {
+    /* SCAN: approximate behavior by starting playback from the requested address.
+     * Many DOS/Win utilities only use this to move the play position. */
+    CDROM_Interface *cdrom = getMSCDEXDrive();
+    if (cdrom == NULL) {
+        sector_total = 0;
+        return;
+    }
+
+    /* cmd[1] bit 4 is direction on many drives; ignore and just reposition */
+    const bool use_msf = !!(atapi_cmd[1] & 0x02);
+    uint32_t start_lba = 0;
+    if (use_msf)
+        start_lba = IDE_ATAPI_MSFtoLBA(atapi_cmd[3],atapi_cmd[4],atapi_cmd[5]);
+    else
+        start_lba = ((uint32_t)atapi_cmd[2] << 24) +
+            ((uint32_t)atapi_cmd[3] << 16) +
+            ((uint32_t)atapi_cmd[4] << 8) +
+            ((uint32_t)atapi_cmd[5] << 0);
+
+    cdrom->PlayAudioSector(start_lba,75u); /* play ~1 second worth, enough for "scan" style UX */
+    sector_total = 0;
+}
+
+void IDEATAPICDROMDevice::play_cd() {
+    /* PLAY CD: treat as MSF play command */
+    CDROM_Interface *cdrom = getMSCDEXDrive();
+    if (cdrom == NULL) {
+        sector_total = 0;
+        return;
+    }
+
+    uint32_t start_lba = IDE_ATAPI_MSFtoLBA(atapi_cmd[3],atapi_cmd[4],atapi_cmd[5]);
+    uint32_t end_lba = IDE_ATAPI_MSFtoLBA(atapi_cmd[6],atapi_cmd[7],atapi_cmd[8]);
+
+    if (end_lba > start_lba)
+        cdrom->PlayAudioSector(start_lba,end_lba - start_lba);
+
+    sector_total = 0;
+}
+
 #if 0 /* TODO move to library */
 static unsigned char dec2bcd(unsigned char c) {
     return ((c / 10) << 4) + (c % 10);
@@ -1035,6 +1203,241 @@ void IDEATAPICDROMDevice::read_toc() {
     prepare_read(0,MIN(MIN((unsigned int)(write-sector),(unsigned int)host_maximum_byte_count),AllocationLength));
 }
 
+void IDEATAPICDROMDevice::read_header() {
+    /* READ HEADER: return a minimal 8-byte header block.
+     * Many stacks use this only to translate LBA<->MSF and sanity check. */
+    const uint32_t lba = ((uint32_t)atapi_cmd[2] << 24u) |
+        ((uint32_t)atapi_cmd[3] << 16u) |
+        ((uint32_t)atapi_cmd[4] << 8u) |
+        ((uint32_t)atapi_cmd[5] << 0u);
+    const unsigned int AllocationLength = ((unsigned int)atapi_cmd[7] << 8u) + atapi_cmd[8];
+
+    memset(sector,0,8);
+
+    /* Report "mode 1" style header. Keep it simple: a plausible historic value that most software ignores. */
+    sector[0] = 0x01;
+    sector[1] = 0x00;
+
+    uint8_t m=0,s=0,f=0;
+    IDE_ATAPI_LBAtoMSF(lba,m,s,f);
+    sector[4] = m;
+    sector[5] = s;
+    sector[6] = f;
+    sector[7] = 0x01; /* data track / mode 1 */
+
+    prepare_read(0,MIN(MIN((unsigned int)8,(unsigned int)host_maximum_byte_count),AllocationLength));
+}
+
+void IDEATAPICDROMDevice::read_cd_msf() {
+    /* READ CD MSF: treat like a READ using MSF start/end. */
+    const unsigned int AllocationLength = ((unsigned int)lba[1] & 0xFFu) | (((unsigned int)lba[2] & 0xFFu) << 8u);
+    const uint32_t start_lba = IDE_ATAPI_MSFtoLBA(atapi_cmd[3],atapi_cmd[4],atapi_cmd[5]);
+    const uint32_t end_lba = IDE_ATAPI_MSFtoLBA(atapi_cmd[6],atapi_cmd[7],atapi_cmd[8]);
+    const uint32_t len = (end_lba > start_lba) ? (end_lba - start_lba) : 0;
+
+    /* Set up a READ-like transfer in the existing state machine */
+    sector_total = AllocationLength;
+    LBA = start_lba;
+    TransferLengthRemaining = len;
+    TransferLength = len;
+    TransferSectorSize = 2048;
+    if (TransferLength > sector_transfer_limit) TransferLength = sector_transfer_limit;
+    if ((TransferLength*TransferSectorSize) > sizeof(sector)) TransferLength = sizeof(sector)/TransferSectorSize;
+    if ((TransferLength*TransferSectorSize) > sector_total) TransferLength = sector_total/TransferSectorSize;
+    if (TransferLengthRemaining >= TransferLength) TransferLengthRemaining -= TransferLength;
+    LBAnext = LBA;
+}
+
+void IDEATAPICDROMDevice::read_cd_da() {
+    /* Vendor READ CD-DA: raw 2352-byte frames.
+     * Many legacy DOS players use this for digital audio extraction. */
+    const unsigned int AllocationLength = ((unsigned int)lba[1] & 0xFFu) | (((unsigned int)lba[2] & 0xFFu) << 8u);
+    const uint32_t start_lba = ((uint32_t)atapi_cmd[2] << 24u) |
+        ((uint32_t)atapi_cmd[3] << 16u) |
+        ((uint32_t)atapi_cmd[4] << 8u) |
+        ((uint32_t)atapi_cmd[5] << 0u);
+    const uint32_t len = ((uint32_t)atapi_cmd[6] << 16u) |
+        ((uint32_t)atapi_cmd[7] << 8u) |
+        ((uint32_t)atapi_cmd[8] << 0u);
+
+    sector_total = AllocationLength;
+    LBA = start_lba;
+    TransferLengthRemaining = len;
+    TransferLength = len;
+    TransferSectorSize = 2352;
+    if (TransferLength > sector_transfer_limit) TransferLength = sector_transfer_limit;
+    if ((TransferLength*TransferSectorSize) > sizeof(sector)) TransferLength = sizeof(sector)/TransferSectorSize;
+    if ((TransferLength*TransferSectorSize) > sector_total) TransferLength = sector_total/TransferSectorSize;
+    if (TransferLengthRemaining >= TransferLength) TransferLengthRemaining -= TransferLength;
+    LBAnext = LBA;
+}
+
+void IDEATAPICDROMDevice::get_configuration() {
+    /* GET CONFIGURATION: minimal, practical reply.
+     * Real drives expose many features; we return only what typical software probes for. */
+    const unsigned int AllocationLength = ((unsigned int)atapi_cmd[7] << 8u) + atapi_cmd[8];
+    memset(sector,0,32);
+
+    /* Header: data length (filled later), current profile = 0 (unknown/none) */
+    /* Return one feature descriptor: "Core" (feature 0x0001) as current. */
+    sector[8]  = 0x00;
+    sector[9]  = 0x01;
+    sector[10] = 0x01; /* current */
+    sector[11] = 0x04; /* additional length */
+
+    /* Indicate a removable CD device that can read. Keep additional bytes 0. */
+    unsigned int total = 8u + 8u; /* header (8) + feature (8) */
+    sector[0] = (uint8_t)((total - 4u) >> 24u);
+    sector[1] = (uint8_t)((total - 4u) >> 16u);
+    sector[2] = (uint8_t)((total - 4u) >> 8u);
+    sector[3] = (uint8_t)((total - 4u) >> 0u);
+    sector_total = total;
+    prepare_read(0,MIN(MIN((unsigned int)sector_total,(unsigned int)host_maximum_byte_count),AllocationLength));
+}
+
+void IDEATAPICDROMDevice::get_event_status_notification() {
+    /* GET EVENT STATUS NOTIFICATION: minimal polling interface.
+     * We only report media status and clear 'changed' after a successful poll. */
+    const unsigned int AllocationLength = ((unsigned int)atapi_cmd[7] << 8u) + atapi_cmd[8];
+    const bool polled = !!(atapi_cmd[1] & 0x01);
+
+    bool mediaPresent=false, mediaChanged=false, trayOpen=false;
+    CDROM_Interface *cdrom = getMSCDEXDrive();
+    if (cdrom) cdrom->GetMediaTrayStatus(mediaPresent,mediaChanged,trayOpen);
+
+    memset(sector,0,8+4);
+    /* header */
+    const uint16_t len = 4; /* only one descriptor */
+    sector[0] = (uint8_t)(len >> 8);
+    sector[1] = (uint8_t)(len >> 0);
+    sector[2] = 0x01; /* NEA - no events available by default */
+    sector[3] = 0x10; /* supported class mask: media */
+
+    /* media event descriptor */
+    sector[4] = 0x02; /* media status event */
+    sector[5] = 0x02; /* descriptor length */
+    sector[6] = (mediaPresent ? 0x02 : 0x00) | ((mediaChanged || has_changed) ? 0x01 : 0x00);
+    sector[7] = (trayOpen ? 0x01 : 0x00);
+
+    if (polled) {
+        /* clear latched change after a successful poll */
+        has_changed = false;
+    }
+
+    sector_total = 12;
+    prepare_read(0,MIN(MIN((unsigned int)sector_total,(unsigned int)host_maximum_byte_count),AllocationLength));
+}
+
+void IDEATAPICDROMDevice::read_disc_information() {
+    const unsigned int AllocationLength = ((unsigned int)atapi_cmd[7] << 8u) + atapi_cmd[8];
+    memset(sector,0,34);
+
+    int first=1,last=1;
+    TMSF leadOut = {};
+    CDROM_Interface *cdrom = getMSCDEXDrive();
+    if (cdrom) cdrom->GetAudioTracks(first,last,leadOut);
+
+    /* length (not including itself) */
+    sector[0] = 0x00;
+    sector[1] = 32;
+    /* Disc status: complete; state bits are mostly ignored by DOS/Win code */
+    sector[2] = 0x02;
+    sector[3] = 0x00;
+    sector[4] = 0x01; /* first track */
+    sector[5] = (uint8_t)last; /* last track */
+
+    sector_total = 34;
+    prepare_read(0,MIN(MIN((unsigned int)sector_total,(unsigned int)host_maximum_byte_count),AllocationLength));
+}
+
+void IDEATAPICDROMDevice::read_track_information() {
+    const unsigned int AllocationLength = ((unsigned int)atapi_cmd[7] << 8u) + atapi_cmd[8];
+    /* Track number is in cmd[5] for the common usage; tolerate 0 meaning "first". */
+    uint8_t track = atapi_cmd[5];
+    if (track == 0) track = 1;
+
+    memset(sector,0,36);
+
+    CDROM_Interface *cdrom = getMSCDEXDrive();
+    if (cdrom == NULL) {
+        sector_total = 0;
+        prepare_read(0,0);
+        return;
+    }
+
+    int first,last;
+    TMSF leadOut;
+    if (!cdrom->GetAudioTracks(first,last,leadOut)) {
+        sector_total = 0;
+        prepare_read(0,0);
+        return;
+    }
+    if (track < (uint8_t)first) track = (uint8_t)first;
+    if (track > (uint8_t)last) track = (uint8_t)last;
+
+    unsigned char attr = 0;
+    TMSF start = {};
+    if (!cdrom->GetAudioTrackInfo((int)track,start,attr)) {
+        sector_total = 0;
+        prepare_read(0,0);
+        return;
+    }
+
+    uint32_t start_lba = IDE_ATAPI_MSFtoLBA(start.min,start.sec,start.fr);
+    uint32_t end_lba = IDE_ATAPI_MSFtoLBA(leadOut.min,leadOut.sec,leadOut.fr);
+    if (track < (uint8_t)last) {
+        TMSF next = {};
+        if (cdrom->GetAudioTrackInfo((int)(track+1),next,attr))
+            end_lba = IDE_ATAPI_MSFtoLBA(next.min,next.sec,next.fr);
+    }
+
+    const uint32_t size_lba = (end_lba > start_lba) ? (end_lba - start_lba) : 0;
+
+    /* length */
+    sector[0] = 0x00;
+    sector[1] = 34;
+    /* track number */
+    sector[2] = 0x00;
+    sector[3] = track;
+    /* start LBA */
+    sector[8]  = (uint8_t)(start_lba >> 24u);
+    sector[9]  = (uint8_t)(start_lba >> 16u);
+    sector[10] = (uint8_t)(start_lba >> 8u);
+    sector[11] = (uint8_t)(start_lba >> 0u);
+    /* track size in LBA */
+    sector[12] = (uint8_t)(size_lba >> 24u);
+    sector[13] = (uint8_t)(size_lba >> 16u);
+    sector[14] = (uint8_t)(size_lba >> 8u);
+    sector[15] = (uint8_t)(size_lba >> 0u);
+
+    sector_total = 36;
+    prepare_read(0,MIN(MIN((unsigned int)sector_total,(unsigned int)host_maximum_byte_count),AllocationLength));
+}
+
+void IDEATAPICDROMDevice::get_performance() {
+    const unsigned int AllocationLength = ((unsigned int)atapi_cmd[8] << 8u) + atapi_cmd[9];
+    memset(sector,0,8);
+    /* Return only the 8-byte header with a zero length body */
+    sector[0] = 0x00;
+    sector[1] = 0x00;
+    sector[2] = 0x00;
+    sector[3] = 0x04;
+    sector_total = 8;
+    prepare_read(0,MIN(MIN((unsigned int)sector_total,(unsigned int)host_maximum_byte_count),AllocationLength));
+}
+
+void IDEATAPICDROMDevice::read_disc_structure() {
+    const unsigned int AllocationLength = ((unsigned int)atapi_cmd[8] << 8u) + atapi_cmd[9];
+    memset(sector,0,8);
+    /* Minimal header with no structure data. This is enough for software that probes support. */
+    sector[0] = 0x00;
+    sector[1] = 0x00;
+    sector[2] = 0x00;
+    sector[3] = 0x04;
+    sector_total = 8;
+    prepare_read(0,MIN(MIN((unsigned int)sector_total,(unsigned int)host_maximum_byte_count),AllocationLength));
+}
+
 /* when the ATAPI command has been accepted, and the timeout has passed */
 void IDEATAPICDROMDevice::on_atapi_busy_time() {
     const unsigned int pk = IDEEventPack(controller->interface_index,slave?1u:0u).get();
@@ -1073,6 +1476,55 @@ void IDEATAPICDROMDevice::on_atapi_busy_time() {
     }
 
     switch (atapi_cmd[0]) {
+        case 0x01: /* REZERO UNIT */
+        case 0x1D: /* SEND DIAGNOSTIC */
+            /* Historically these are no-ops for ATAPI CD-ROM. */
+            count = 0x03;
+            feature = 0x00;
+            sector_total = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0x1B: /* START STOP UNIT */
+            /* Minimal tray / spin control. We mainly use it to model change notification. */
+            {
+                const bool loej = !!(atapi_cmd[4] & 0x02);
+                const bool start = !!(atapi_cmd[4] & 0x01);
+                CDROM_Interface *cdrom = getMSCDEXDrive();
+                if (cdrom) {
+                    if (loej && !start) {
+                        cdrom->LoadUnloadMedia(true);
+                        loading_mode = LOAD_NO_DISC;
+                        has_changed = true;
+                    }
+                    else if (loej && start) {
+                        cdrom->LoadUnloadMedia(false);
+                        loading_mode = LOAD_DISC_LOADING;
+                        has_changed = true;
+                    }
+                    else if (!start) {
+                        loading_mode = LOAD_IDLE;
+                    }
+                    else {
+                        if (loading_mode == LOAD_IDLE) loading_mode = LOAD_DISC_LOADING;
+                    }
+                }
+            }
+            count = 0x03;
+            feature = 0x00;
+            sector_total = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+            raise_irq();
+            allow_writing = true;
+            break;
         case 0x03: /* REQUEST SENSE */
             prepare_read(0,MIN((unsigned int)sense_length,(unsigned int)host_maximum_byte_count));
             memcpy(sector,sense,sense_length);
@@ -1321,6 +1773,87 @@ void IDEATAPICDROMDevice::on_atapi_busy_time() {
             raise_irq();
             allow_writing = true;
             break;
+
+        case 0xB9: /* READ CD MSF */
+            /* We emulate this as a plain 2048-byte read between MSF start/end. */
+            read_cd_msf();
+            if (TransferLength == 0) {
+                feature = 0x00;
+                count = 0x03;
+                sector_total = 0;
+                state = IDE_DEV_READY;
+                status = IDE_STATUS_DRIVE_READY;
+            }
+            else {
+                CDROM_Interface *cdrom = getMSCDEXDrive();
+                bool res = (cdrom != NULL ? cdrom->ReadSectorsHost(sector,false,(unsigned long)LBA,(unsigned long)TransferLength) : false);
+                if (res) {
+                    prepare_read(0,MIN((unsigned int)(TransferLength*2048u),(unsigned int)host_maximum_byte_count));
+                    LBAnext = LBA + TransferLength;
+                    feature = 0x00;
+                    count = 0x02;
+                    state = IDE_DEV_DATA_READ;
+                    status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+                }
+                else {
+                    if (cdrom && cdrom->class_id == CDROM_Interface::INTERFACE_TYPE::ID_FAKE)
+                        set_sense(/*SK=*/0x02,/*ASC=*/0x3A);
+                    else
+                        set_sense(/*SK=*/0x03,/*ASC=*/0x11);
+                    feature = 0xF4;
+                    count = 0x03;
+                    sector_total = 0;
+                    TransferLength = 0;
+                    TransferLengthRemaining = 0;
+                    state = IDE_DEV_READY;
+                    status = IDE_STATUS_DRIVE_READY|IDE_STATUS_ERROR;
+                }
+            }
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+            raise_irq();
+            allow_writing = true;
+            break;
+
+        case 0xD8: /* READ CD-DA (vendor) */
+            read_cd_da();
+            if (TransferLength == 0) {
+                feature = 0x00;
+                count = 0x03;
+                sector_total = 0;
+                state = IDE_DEV_READY;
+                status = IDE_STATUS_DRIVE_READY;
+            }
+            else {
+                CDROM_Interface *cdrom = getMSCDEXDrive();
+                bool res = (cdrom != NULL ? cdrom->ReadSectorsHost(sector,true,(unsigned long)LBA,(unsigned long)TransferLength) : false);
+                if (res) {
+                    prepare_read(0,MIN((unsigned int)(TransferLength*2352u),(unsigned int)host_maximum_byte_count));
+                    LBAnext = LBA + TransferLength;
+                    feature = 0x00;
+                    count = 0x02;
+                    state = IDE_DEV_DATA_READ;
+                    status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+                }
+                else {
+                    if (cdrom && cdrom->class_id == CDROM_Interface::INTERFACE_TYPE::ID_FAKE)
+                        set_sense(/*SK=*/0x02,/*ASC=*/0x3A);
+                    else
+                        set_sense(/*SK=*/0x03,/*ASC=*/0x11);
+                    feature = 0xF4;
+                    count = 0x03;
+                    sector_total = 0;
+                    TransferLength = 0;
+                    TransferLengthRemaining = 0;
+                    state = IDE_DEV_READY;
+                    status = IDE_STATUS_DRIVE_READY|IDE_STATUS_ERROR;
+                }
+            }
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+            raise_irq();
+            allow_writing = true;
+            break;
         case 0x42: /* READ SUB-CHANNEL */
             read_subchannel();
 
@@ -1381,6 +1914,82 @@ void IDEATAPICDROMDevice::on_atapi_busy_time() {
             raise_irq();
             allow_writing = true;
             break;
+        case 0x48: /* PLAY AUDIO TRACK/INDEX */
+            play_audio_track_index();
+
+            count = 0x03;
+            feature = 0x00;
+            sector_total = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+
+            /* ATAPI protocol also says we write back into LBA 23:8 what we're going to transfer in the block */
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0x4E: /* STOP PLAY/SCAN */
+            stop_play_scan();
+
+            count = 0x03;
+            feature = 0x00;
+            sector_total = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0xA5: /* PLAY AUDIO(12) */
+            play_audio12();
+
+            count = 0x03;
+            feature = 0x00;
+            sector_total = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0xBA: /* SCAN */
+            scan_audio();
+
+            count = 0x03;
+            feature = 0x00;
+            sector_total = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0xBC: /* PLAY CD */
+            play_cd();
+
+            count = 0x03;
+            feature = 0x00;
+            sector_total = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+
+            raise_irq();
+            allow_writing = true;
+            break;
         case 0x4B: /* PAUSE/RESUME */
             pause_resume();
 
@@ -1394,6 +2003,77 @@ void IDEATAPICDROMDevice::on_atapi_busy_time() {
             lba[2] = sector_total >> 8;
             lba[1] = sector_total;
 
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0x44: /* READ HEADER */
+            read_header();
+
+            feature = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0x46: /* GET CONFIGURATION */
+            get_configuration();
+            feature = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0x4A: /* GET EVENT STATUS NOTIFICATION */
+            get_event_status_notification();
+            feature = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0x51: /* READ DISC INFORMATION */
+            read_disc_information();
+            feature = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0x52: /* READ TRACK INFORMATION */
+            read_track_information();
+            feature = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0xAC: /* GET PERFORMANCE */
+            get_performance();
+            feature = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
+            raise_irq();
+            allow_writing = true;
+            break;
+        case 0xAD: /* READ DISC STRUCTURE */
+            read_disc_structure();
+            feature = 0x00;
+            state = IDE_DEV_DATA_READ;
+            status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRQ|IDE_STATUS_DRIVE_SEEK_COMPLETE;
+            lba[2] = sector_total >> 8;
+            lba[1] = sector_total;
             raise_irq();
             allow_writing = true;
             break;
@@ -2233,9 +2913,24 @@ void IDEATAPICDROMDevice::atapi_cmd_completion() {
                 allow_writing = true;
             }
             break;
-        case 0x45: /* PLAY AUDIO (1) */
+        case 0x01: /* REZERO UNIT */
+        case 0x1B: /* START STOP UNIT */
+        case 0x1D: /* SEND DIAGNOSTIC */
+        case 0x44: /* READ HEADER */
+        case 0x46: /* GET CONFIGURATION */
+        case 0x4A: /* GET EVENT STATUS NOTIFICATION */
+        case 0x51: /* READ DISC INFORMATION */
+        case 0x52: /* READ TRACK INFORMATION */
+        case 0xAC: /* GET PERFORMANCE */
+        case 0xAD: /* READ DISC STRUCTURE */
+        case 0x45: /* PLAY AUDIO(10) */
         case 0x47: /* PLAY AUDIO MSF */
+        case 0x48: /* PLAY AUDIO TRACK/INDEX */
         case 0x4B: /* PAUSE/RESUME */
+        case 0x4E: /* STOP PLAY/SCAN */
+        case 0xA5: /* PLAY AUDIO(12) */
+        case 0xBA: /* SCAN */
+        case 0xBC: /* PLAY CD */
             if (common_spinup_response(/*spin up*/true,/*wait*/true)) {
                 set_sense(0); /* <- nothing wrong */
 
@@ -2244,6 +2939,26 @@ void IDEATAPICDROMDevice::atapi_cmd_completion() {
                 status = IDE_STATUS_BUSY;
                 PIC_RemoveSpecificEvents(IDE_DelayedCommand,pk);
                 PIC_AddEvent(IDE_DelayedCommand,(faked_command ? 0.000001 : 1)/*ms*/,pk);
+            }
+            else {
+                count = 0x03;
+                state = IDE_DEV_READY;
+                feature = ((sense[2]&0xF) << 4) | ((sense[2]&0xF) ? 0x04/*abort*/ : 0x00);
+                status = IDE_STATUS_DRIVE_READY|((sense[2]&0xF) ? IDE_STATUS_ERROR:IDE_STATUS_DRIVE_SEEK_COMPLETE);
+                raise_irq();
+                allow_writing = true;
+            }
+            break;
+        case 0xB9: /* READ CD MSF */
+        case 0xD8: /* READ CD-DA (vendor) */
+            if (common_spinup_response(/*spin up*/true,/*wait*/true)) {
+                set_sense(0);
+                /* Data setup is done in the delayed handler. */
+                count = 0x02;
+                state = IDE_DEV_ATAPI_BUSY;
+                status = IDE_STATUS_BUSY;
+                PIC_RemoveSpecificEvents(IDE_DelayedCommand,pk);
+                PIC_AddEvent(IDE_DelayedCommand,(faked_command ? 0.000001 : 3)/*ms*/,pk);
             }
             else {
                 count = 0x03;
@@ -2280,7 +2995,8 @@ void IDEATAPICDROMDevice::atapi_cmd_completion() {
             LOG_MSG("Unknown ATAPI command %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
                 atapi_cmd[ 0],atapi_cmd[ 1],atapi_cmd[ 2],atapi_cmd[ 3],atapi_cmd[ 4],atapi_cmd[ 5],
                 atapi_cmd[ 6],atapi_cmd[ 7],atapi_cmd[ 8],atapi_cmd[ 9],atapi_cmd[10],atapi_cmd[11]);
-
+            /* Persistent sense for the guest to fetch via REQUEST SENSE */
+            set_sense(/*SK=*/0x05,/*ASC=*/0x20,/*ASCQ=*/0x00); /* ILLEGAL REQUEST: invalid command */
             abort_error();
             count = 0x03; /* no more data (command/data=1, input/output=1) */
             feature = 0xF4;
